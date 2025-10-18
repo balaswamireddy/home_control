@@ -1,0 +1,316 @@
+// WiFi and HTTP libraries
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// WiFi credentials
+const char* ssid = "Stone age";
+const char* password = "stoneage";
+
+// Supabase configuration
+const char* supabaseUrl = "https://nchshzvzjwlhquvjzhsi.supabase.co";
+const char* supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jaHNoenZ6andsaHF1dmp6aHNpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjAwNzU4NDIsImV4cCI6MjA3NTY1MTg0Mn0.ASwxbx9m6a09MT8x31qvkSwy2yBLHAVhOMZ3jutLNS8";
+const char* deviceId = "WATER_MON_001";
+
+// Pin definitions
+#define ONE_WIRE_BUS 32
+#define TDS_SENSOR_PIN 33
+#define WATER_FLOW_SENSOR_PIN1 15
+#define WATER_FLOW_SENSOR_PIN2 14
+
+// Sensor setup
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// Variables
+float temperature = 25.0;
+int tdsValue = 0;
+
+// YF-S201 CALIBRATION CONSTANT: 450 pulses per liter
+const float CALIBRATION_FACTOR = 450.0;  // pulses per liter for YF-S201
+
+// Water flow sensor variables
+volatile unsigned long pulseCount1 = 0;
+volatile unsigned long pulseCount2 = 0;
+float flowRate1 = 0.0;        // L/min
+float flowRate2 = 0.0;        // L/min
+float totalFlowRate = 0.0;    // L/min
+float totalWater = 0.0;       // Total liters
+unsigned long oldTime = 0;
+
+// Timing variables for Supabase
+unsigned long lastSendTime = 0;
+unsigned long sendInterval = 5000; // 5 seconds like your original
+unsigned long lastCheckTime = 0;
+unsigned long checkInterval = 3000; // Check for reset command every 3 seconds
+
+// Interrupt functions - EXACT COPY
+void IRAM_ATTR pulseCounter1() {
+  pulseCount1++;
+}
+
+void IRAM_ATTR pulseCounter2() {
+  pulseCount2++;
+}
+
+// Function to read temperature - EXACT COPY
+float readTemperature() {
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+  if (tempC == DEVICE_DISCONNECTED_C) {
+    Serial.println("Error: Could not read temperature data");
+    return 25.0;
+  }
+  return tempC;
+}
+
+// Function to read TDS - EXACT COPY
+int readTDS() {
+  tdsValue = analogRead(TDS_SENSOR_PIN);
+  return tdsValue;
+}
+
+// Function to send all sensor data with CORRECT YF-S201 FORMULA
+void sendData() {
+  // Calculate time elapsed (in milliseconds) - EXACT COPY
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - oldTime;
+  oldTime = currentTime;
+  
+  // CORRECT YF-S201 CALCULATION - EXACT COPY
+  // Flow rate (L/min) = (pulses / calibration_factor) * (60000 ms/min / elapsed_time_ms)
+  
+  if (elapsedTime > 0) {
+    // For sensor 1: Convert pulses to liters, then to L/min
+    flowRate1 = ((float)pulseCount1 / CALIBRATION_FACTOR) * (60000.0 / elapsedTime);
+    
+    // For sensor 2: Same calculation
+    flowRate2 = ((float)pulseCount2 / CALIBRATION_FACTOR) * (60000.0 / elapsedTime);
+    
+    // Total flow rate from both sensors
+    totalFlowRate = flowRate1 + flowRate2;
+    
+    // Calculate total water (liters) - add the water that flowed in this interval
+    totalWater += ((float)(pulseCount1 + pulseCount2)) / CALIBRATION_FACTOR;
+  }
+  
+  // Read other sensors
+  temperature = readTemperature();
+  int currentTDS = readTDS();
+  
+  // Debug output - EXACT COPY
+  Serial.println("=== Water Monitoring System ===");
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" °C");
+  
+  Serial.print("TDS Value: ");
+  Serial.println(currentTDS);
+  
+  Serial.print("Pulse Count 1 (interval): ");
+  Serial.println(pulseCount1);
+  
+  Serial.print("Pulse Count 2 (interval): ");
+  Serial.println(pulseCount2);
+  
+  Serial.print("Sensor 1 Flow Rate: ");
+  Serial.print(flowRate1);
+  Serial.println(" L/min");
+  
+  Serial.print("Sensor 2 Flow Rate: ");
+  Serial.print(flowRate2);
+  Serial.println(" L/min");
+  
+  Serial.print("Total Flow Rate: ");
+  Serial.print(totalFlowRate);
+  Serial.println(" L/min");
+  
+  Serial.print("Total Water: ");
+  Serial.print(totalWater);
+  Serial.println(" Liters");
+  
+  Serial.print("Elapsed Time: ");
+  Serial.print(elapsedTime);
+  Serial.println(" ms");
+  Serial.println("==============================");
+  
+  // Send to Supabase
+  sendToSupabase(temperature, currentTDS, flowRate1, flowRate2, totalFlowRate, totalWater, pulseCount1, pulseCount2, elapsedTime);
+  
+  // Reset pulse counters - EXACT COPY
+  pulseCount1 = 0;
+  pulseCount2 = 0;
+}
+
+// Function to send sensor data to Supabase
+void sendToSupabase(float temp, int tds, float fr1, float fr2, float tfr, float tw, unsigned long pc1, unsigned long pc2, unsigned long elapsed) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    // Prepare JSON payload
+    StaticJsonDocument<512> doc;
+    doc["device_id"] = deviceId;
+    doc["temperature"] = temp;
+    doc["tds_value"] = tds;
+    doc["flow_rate_sensor1"] = fr1;
+    doc["flow_rate_sensor2"] = fr2;
+    doc["total_flow_rate"] = tfr;
+    doc["total_water"] = tw;
+    doc["pulse_count1"] = (int)pc1;
+    doc["pulse_count2"] = (int)pc2;
+    doc["elapsed_time"] = (int)elapsed;
+    
+    String jsonPayload;
+    serializeJson(doc, jsonPayload);
+    
+    // API endpoint for inserting data
+    String apiUrl = String(supabaseUrl) + "/rest/v1/water_readings";
+    
+    http.begin(apiUrl);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("apikey", supabaseKey);
+    http.addHeader("Authorization", String("Bearer ") + supabaseKey);
+    http.addHeader("Prefer", "return=representation");
+    
+    int httpResponseCode = http.POST(jsonPayload);
+    
+    if (httpResponseCode > 0) {
+      Serial.println("✓ Data sent to Supabase successfully");
+      Serial.print("HTTP Response code: ");
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("✗ Error sending data: ");
+      Serial.println(httpResponseCode);
+      Serial.println(http.errorToString(httpResponseCode));
+    }
+    
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected - Cannot send data");
+  }
+}
+
+// Function to check for reset command from Supabase
+void checkResetCommand() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    // API endpoint to get control commands
+    String apiUrl = String(supabaseUrl) + "/rest/v1/water_controls?device_id=eq." + String(deviceId) + "&select=reset_counter";
+    
+    http.begin(apiUrl);
+    http.addHeader("apikey", supabaseKey);
+    http.addHeader("Authorization", String("Bearer ") + supabaseKey);
+    
+    int httpResponseCode = http.GET();
+    
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, response);
+      
+      if (!error && doc.size() > 0) {
+        bool resetCounter = doc[0]["reset_counter"];
+        
+        if (resetCounter) {
+          // EXACT COPY of your reset logic
+          totalWater = 0;
+          pulseCount1 = 0;
+          pulseCount2 = 0;
+          Serial.println("✓ Total water counter reset from app");
+          
+          // Reset the flag in database
+          resetResetFlag();
+        }
+      }
+    }
+    
+    http.end();
+  }
+}
+
+// Function to reset the reset_counter flag in database
+void resetResetFlag() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    String apiUrl = String(supabaseUrl) + "/rest/v1/water_controls?device_id=eq." + String(deviceId);
+    
+    http.begin(apiUrl);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("apikey", supabaseKey);
+    http.addHeader("Authorization", String("Bearer ") + supabaseKey);
+    
+    String payload = "{\"reset_counter\": false}";
+    int httpResponseCode = http.PATCH(payload);
+    
+    if (httpResponseCode > 0) {
+      Serial.println("✓ Reset flag cleared in database");
+    }
+    
+    http.end();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize sensors - EXACT COPY
+  sensors.begin();
+  pinMode(TDS_SENSOR_PIN, INPUT);
+  pinMode(WATER_FLOW_SENSOR_PIN1, INPUT_PULLUP);
+  pinMode(WATER_FLOW_SENSOR_PIN2, INPUT_PULLUP);
+  
+  // Attach interrupts - EXACT COPY
+  attachInterrupt(digitalPinToInterrupt(WATER_FLOW_SENSOR_PIN1), pulseCounter1, RISING);
+  attachInterrupt(digitalPinToInterrupt(WATER_FLOW_SENSOR_PIN2), pulseCounter2, RISING);
+  
+  // Initialize timing - EXACT COPY
+  oldTime = millis();
+  
+  // Connect to WiFi
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n✗ WiFi connection failed");
+  }
+  
+  Serial.println("========================================");
+  Serial.println("Smart Water Monitoring System Started");
+  Serial.println("YF-S201 sensors with correct calibration (450 pulses/liter)");
+  Serial.println("Connected to Supabase Backend");
+  Serial.println("========================================");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Send data every 5 seconds like your original
+  if (currentTime - lastSendTime >= sendInterval) {
+    sendData();
+    lastSendTime = currentTime;
+  }
+  
+  // Check for reset command every 3 seconds
+  if (currentTime - lastCheckTime >= checkInterval) {
+    checkResetCommand();
+    lastCheckTime = currentTime;
+  }
+  
+  delay(10); // Small delay to prevent watchdog issues
+}
